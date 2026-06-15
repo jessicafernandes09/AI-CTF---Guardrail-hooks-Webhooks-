@@ -15,6 +15,8 @@ import time
 import logging
 import os
 import ipaddress
+import hmac
+import hashlib
 from collections import defaultdict
 from datetime import datetime
 from typing import Optional
@@ -34,6 +36,9 @@ app = Flask(__name__)
 # ── Config (set via Render environment variables) ──────────────────────────────
 RATE_LIMIT_MAX    = int(os.environ.get("RATE_LIMIT_MAX",    "30"))   # requests
 RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))   # per N seconds
+
+WEBHOOK_SECRET     = os.environ.get("WEBHOOK_SECRET", "")
+TIMESTAMP_TOLERANCE = int(os.environ.get("TIMESTAMP_TOLERANCE", "300"))
 
 # FinBot's server IP ranges — add the real ones once you see them in your logs
 # Empty list = allowlist disabled (open to all, log only)
@@ -64,6 +69,35 @@ def is_rate_limited(ip: str) -> bool:
         return True
     _rate_store[ip].append(now)
     return False
+
+# ── Signature verification ──────────────────────────────────────────────────
+def verify_signature(raw_body: bytes, signature_header: str, timestamp_header: str) -> bool:
+    """
+    Verifies X-Guardrail-Signature: sha256=<hmac> over "timestamp.body".
+    If WEBHOOK_SECRET is not set, verification is skipped (open mode).
+    """
+    if not WEBHOOK_SECRET:
+        return True  # no secret configured — skip verification
+
+    if not signature_header or not timestamp_header:
+        return False
+
+    try:
+        ts = int(timestamp_header)
+    except ValueError:
+        return False
+
+    if abs(time.time() - ts) > TIMESTAMP_TOLERANCE:
+        return False
+
+    signed_payload = f"{timestamp_header}.".encode() + raw_body
+    expected = hmac.new(WEBHOOK_SECRET.encode(), signed_payload, hashlib.sha256).hexdigest()
+
+    received = signature_header
+    if received.startswith("sha256="):
+        received = received[len("sha256="):]
+
+    return hmac.compare_digest(expected, received)
 
 # ── IP Allowlist ───────────────────────────────────────────────────────────────
 def is_allowed_ip(ip: str) -> bool:
@@ -190,6 +224,15 @@ def guardrail():
         return jsonify({"verdict": "block", "reason": "Rate limit exceeded."}), 429
 
     # ── Layer 3: Payload validation ────────────────────────────────────────────
+    raw_body = request.get_data()
+
+    sig_header = request.headers.get("X-Guardrail-Signature", "")
+    ts_header  = request.headers.get("X-Guardrail-Timestamp", "")
+
+    if not verify_signature(raw_body, sig_header, ts_header):
+        logger.warning(f"BAD_SIGNATURE | ip={ip}")
+        return jsonify({"verdict": "block", "reason": "Invalid or missing signature."}), 200
+
     try:
         raw = request.get_json(force=True, silent=True)
         if not raw:
